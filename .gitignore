@@ -1,0 +1,11 @@
+# Local secrets
+.env
+.env.*
+!.env.example
+config.local.json
+
+# Generated Java files
+*.class
+target/
+build/
+out/

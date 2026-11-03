@@ -1,7 +1,11 @@
 package ca.yorku.eecs3311.cli;
 
+import ca.yorku.eecs3311.agent.AgentException;
+import ca.yorku.eecs3311.ai.DeepSeekClient;
 import ca.yorku.eecs3311.application.DurationSuggestion;
+import ca.yorku.eecs3311.application.PlanProposal;
 import ca.yorku.eecs3311.application.StudyApplication;
+import ca.yorku.eecs3311.config.AppConfig;
 import ca.yorku.eecs3311.model.AcademicTask;
 import ca.yorku.eecs3311.model.Course;
 import ca.yorku.eecs3311.model.StudyPlan;
@@ -44,6 +48,7 @@ public class StudyCLI {
     private final BufferedReader input;
     private final PrintStream output;
     private final Clock clock;
+    private PlanProposal pendingProposal;
 
     public StudyCLI(StudyApplication application, InputStream input, PrintStream output,
                     Clock clock) {
@@ -59,7 +64,9 @@ public class StudyCLI {
     public static void main(String[] args) throws IOException {
         Path file = Path.of(args.length > 0 ? args[0] : "data/repository.json");
         LocalRepository repository = new LocalRepository(file);
-        StudyApplication application = new StudyApplication(repository);
+        AppConfig config = AppConfig.load();
+        StudyApplication application = new StudyApplication(repository, Clock.systemDefaultZone(),
+                config.hasApiKey() ? DeepSeekClient.fromConfig(config) : null);
         new StudyCLI(application, System.in, System.out, Clock.systemDefaultZone()).run();
     }
 
@@ -116,6 +123,10 @@ public class StudyCLI {
                 case "period-add" -> addPeriod(args);
                 case "period-remove" -> removePeriod(args);
                 case "plan" -> showPlan(args);
+                case "plan-generate" -> generatePlan(args);
+                case "plan-revise" -> revisePlan(args);
+                case "plan-accept" -> acceptPlan();
+                case "plan-reject" -> rejectPlan();
                 case "record" -> recordProgress(args);
                 case "duration" -> showDuration(args);
                 case "duration-accept" -> acceptDuration(args);
@@ -124,6 +135,9 @@ public class StudyCLI {
             }
         } catch (IllegalArgumentException | IllegalStateException | DateTimeParseException e) {
             output.println("Error: " + e.getMessage());
+        } catch (AgentException e) {
+            output.println("The AI assistant could not produce a plan: " + e.getMessage());
+            output.println("Nothing was changed.");
         } catch (IOException e) {
             output.println("Error: could not save your data (" + e.getMessage() + ")");
         }
@@ -148,8 +162,13 @@ public class StudyCLI {
                   periods                              list weekly periods
                   period-add availability|commitment DAY HH:mm HH:mm
                   period-remove N
-                Study plan and progress (F06)
-                  plan [YYYY-MM-DD]                    show the plan for that week (default: this week)
+                Study plan (F04, F05) - uses the AI assistant
+                  plan [YYYY-MM-DD]                    show the saved plan for that week (default: this week)
+                  plan-generate [YYYY-MM-DD]           propose a new plan for the week
+                  plan-revise [YYYY-MM-DD]             propose a revision of the week's plan
+                  plan-accept                          save the proposal shown
+                  plan-reject                          discard the proposal shown
+                Progress (F06)
                   record DATE S STATUS MINUTES REMAINING [finished]
                                                        STATUS: completed | partial | missed
                 Duration estimates (F07)
@@ -272,6 +291,54 @@ public class StudyCLI {
             output.println("No plan for the week of " + week + ".");
             return;
         }
+        printPlans(plans);
+    }
+
+    private void generatePlan(List<String> args) throws AgentException {
+        LocalDate week = weekStart(args.isEmpty() ? null : args.get(0));
+        output.println("Asking the AI assistant to plan the week of " + week + "...");
+        showProposal(application.generatePlan(week));
+    }
+
+    private void revisePlan(List<String> args) throws AgentException {
+        LocalDate week = weekStart(args.isEmpty() ? null : args.get(0));
+        output.println("Asking the AI assistant to revise the week of " + week + "...");
+        showProposal(application.revisePlan(week));
+    }
+
+    private void showProposal(PlanProposal proposal) {
+        pendingProposal = proposal;
+        output.println(proposal.revision() ? "Proposed revision (not saved yet):"
+                : "Proposed plan (not saved yet):");
+        printPlans(List.of(proposal.plan()));
+        output.println("Type plan-accept to save it or plan-reject to discard it.");
+    }
+
+    private void acceptPlan() throws IOException {
+        if (pendingProposal == null) {
+            throw new IllegalStateException(
+                    "There is no proposal to accept. Use plan-generate or plan-revise first.");
+        }
+        PlanProposal proposal = pendingProposal;
+        pendingProposal = null;
+        try {
+            application.acceptPlan(proposal);
+        } catch (IOException e) {
+            pendingProposal = proposal;
+            throw e;
+        }
+        output.println("Plan saved.");
+    }
+
+    private void rejectPlan() {
+        if (pendingProposal == null) {
+            throw new IllegalStateException("There is no proposal to discard.");
+        }
+        pendingProposal = null;
+        output.println("Proposal discarded. Your saved plan was not changed.");
+    }
+
+    private void printPlans(List<StudyPlan> plans) {
         Map<String, String> titles = taskTitles();
         for (StudyPlan plan : plans) {
             output.println("Week of " + plan.getWeekStartDate()

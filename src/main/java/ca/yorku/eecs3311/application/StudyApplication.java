@@ -1,5 +1,10 @@
 package ca.yorku.eecs3311.application;
 
+import ca.yorku.eecs3311.agent.AgentException;
+import ca.yorku.eecs3311.agent.AgentResult;
+import ca.yorku.eecs3311.agent.PlanningContext;
+import ca.yorku.eecs3311.agent.StudyAgent;
+import ca.yorku.eecs3311.ai.LLMClient;
 import ca.yorku.eecs3311.estimation.CompletedTaskRecord;
 import ca.yorku.eecs3311.estimation.DurationEstimator;
 import ca.yorku.eecs3311.estimation.HistoricalDurationStrategy;
@@ -8,16 +13,28 @@ import ca.yorku.eecs3311.model.AcademicTask;
 import ca.yorku.eecs3311.model.Course;
 import ca.yorku.eecs3311.model.StudyPlan;
 import ca.yorku.eecs3311.model.StudySession;
+import ca.yorku.eecs3311.model.TimeSlot;
 import ca.yorku.eecs3311.model.WeeklyPeriod;
 import ca.yorku.eecs3311.repository.LocalRepository;
+import ca.yorku.eecs3311.scheduling.ScheduleResult;
+import ca.yorku.eecs3311.scheduling.Scheduler;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
+import java.time.DayOfWeek;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Facade: the single entry point the GUI and CLI use. It validates requests,
@@ -25,18 +42,26 @@ import java.util.Map;
  * and keeps related updates together in one atomic repository commit.
  *
  * This version covers courses and tasks (F01), weekly availability (F02),
- * study progress (F06) and duration estimates (F07).
+ * study progress (F06), duration estimates (F07) and AI-assisted weekly
+ * planning and revision (F04, F05).
  */
 public class StudyApplication {
     private final LocalRepository repository;
     private final Clock clock;
+    private final LLMClient llm;
     private final DurationEstimator durationEstimator = new DurationEstimator();
+    private final Scheduler scheduler = new Scheduler();
 
     public StudyApplication(LocalRepository repository) {
         this(repository, Clock.systemDefaultZone());
     }
 
     public StudyApplication(LocalRepository repository, Clock clock) {
+        this(repository, clock, null);
+    }
+
+    // The LLM client may be null; planning then reports that AI is not configured.
+    public StudyApplication(LocalRepository repository, Clock clock, LLMClient llm) {
         if (repository == null) {
             throw new IllegalArgumentException("Repository is required.");
         }
@@ -47,6 +72,7 @@ public class StudyApplication {
 
         this.repository = repository;
         this.clock = clock;
+        this.llm = llm;
     }
 
     // ----- F01: courses and tasks -----
@@ -316,6 +342,207 @@ public class StudyApplication {
             draft.saveTask(task);
             flaggedPlans.forEach(draft::savePlan);
         });
+    }
+
+    // ----- F04 / F05: weekly planning and revision -----
+
+    /**
+     * Ask the planning agent for a new plan for a week. Nothing is saved until the
+     * proposal is accepted with {@link #acceptPlan(PlanProposal)}.
+     */
+    public PlanProposal generatePlan(LocalDate weekStart) throws AgentException {
+        requirePlannableWeek(weekStart);
+        if (!repository.getPlans(weekStart).isEmpty()) {
+            throw new IllegalStateException(
+                    "This week already has a plan; revise it instead.");
+        }
+        requireLlm();
+
+        boolean hasAvailability = repository.getPeriods().stream()
+                .anyMatch(WeeklyPeriod::isAvailability);
+        if (!hasAvailability) {
+            throw new IllegalStateException(
+                    "Add weekly availability before generating a plan.");
+        }
+        PlanningContext context = buildContext(weekStart, false, List.of());
+        if (context.getTasks().isEmpty()) {
+            throw new IllegalStateException("There are no tasks that need study time.");
+        }
+        if (context.getSlots().isEmpty()) {
+            throw new IllegalStateException(
+                    "No usable study time remains in this week.");
+        }
+
+        AgentResult result = new StudyAgent(llm, scheduler).run(context);
+        StudyPlan plan = new StudyPlan(weekStart);
+        return toProposal(plan, false, List.of(), result, weekStart);
+    }
+
+    /**
+     * Ask the planning agent to rebuild the future sessions of the week's plan.
+     * Past and recorded sessions are kept. Nothing is saved until the proposal is accepted.
+     */
+    public PlanProposal revisePlan(LocalDate weekStart) throws AgentException {
+        requirePlannableWeek(weekStart);
+        List<StudyPlan> existing = repository.getPlans(weekStart);
+        if (existing.isEmpty()) {
+            throw new IllegalStateException("This week has no plan to revise.");
+        }
+        StudyPlan current = existing.get(0);
+        List<StudySession> kept = keptSessions(current);
+
+        PlanningContext context = buildContext(weekStart, true, kept);
+        StudyPlan base = new StudyPlan(current.getId(), weekStart, current.isAccepted(), false,
+                current.getPriorityExplanation(), Map.of(), List.of());
+        if (context.getTasks().isEmpty()) {
+            AgentResult nothingLeft = new AgentResult(
+                    new ScheduleResult(List.of(), Map.of()),
+                    "No unfinished tasks remain, so the future sessions were removed.");
+            return toProposal(base, true, kept, nothingLeft, weekStart);
+        }
+
+        requireLlm();
+        AgentResult result = new StudyAgent(llm, scheduler).run(context);
+        return toProposal(base, true, kept, result, weekStart);
+    }
+
+    /**
+     * Save a proposal. The stored data must be unchanged since the proposal was made and
+     * every proposed session must still be valid; otherwise nothing is saved.
+     */
+    public void acceptPlan(PlanProposal proposal) throws IOException {
+        if (proposal == null) {
+            throw new IllegalArgumentException("Proposal is required.");
+        }
+        LocalDate week = proposal.plan().getWeekStartDate();
+        if (!proposal.fingerprint().equals(fingerprint(week))) {
+            throw new IllegalStateException("Your tasks, availability or plan changed since "
+                    + "this proposal was made. Generate it again.");
+        }
+
+        List<StudyPlan> existing = repository.getPlans(week);
+        List<StudySession> kept = proposal.revision() ? keptSessions(existing.get(0)) : List.of();
+        PlanningContext fresh = buildContext(week, proposal.revision(), kept);
+        List<StudySession> proposed = new ArrayList<>();
+        for (StudySession session : proposal.plan().getSessions()) {
+            if (proposal.newSessionIds().contains(session.getId())) {
+                proposed.add(session);
+            }
+        }
+        List<String> problems = scheduler.validatePlan(proposed, fresh.getTasks(), fresh.getSlots());
+        if (!problems.isEmpty()) {
+            throw new IllegalStateException("The proposal is no longer valid ("
+                    + problems.get(0) + "). Generate it again.");
+        }
+
+        StudyPlan source = proposal.plan();
+        StudyPlan accepted = new StudyPlan(source.getId(), week, true, false,
+                source.getPriorityExplanation(), source.getUnscheduledMinutes(),
+                source.getSessions());
+        repository.commit(draft -> draft.savePlan(accepted));
+    }
+
+    private void requireLlm() {
+        if (llm == null) {
+            throw new IllegalStateException(
+                    "The AI assistant is not configured. Add LLM_API_KEY to your .env file.");
+        }
+    }
+
+    private void requirePlannableWeek(LocalDate weekStart) {
+        if (weekStart == null) {
+            throw new IllegalArgumentException("Week start date is required.");
+        }
+        if (weekStart.getDayOfWeek() != DayOfWeek.MONDAY) {
+            throw new IllegalArgumentException("A week must start on a Monday.");
+        }
+        if (!weekStart.plusDays(7).atStartOfDay().isAfter(now())) {
+            throw new IllegalStateException("That week has already ended.");
+        }
+    }
+
+    // Past, started or recorded sessions stay; only future unrecorded ones are rebuilt.
+    private List<StudySession> keptSessions(StudyPlan plan) {
+        LocalDateTime now = now();
+        List<StudySession> kept = new ArrayList<>();
+        for (StudySession session : plan.getSessions()) {
+            boolean replaceable = StudySession.SCHEDULED.equals(session.getStatus())
+                    && session.getStartDateTime().isAfter(now);
+            if (!replaceable) {
+                kept.add(session);
+            }
+        }
+        return kept;
+    }
+
+    private PlanningContext buildContext(LocalDate weekStart, boolean revision,
+                                         List<StudySession> kept) {
+        LocalDateTime now = now();
+        LocalDateTime notBefore = now.isAfter(weekStart.atStartOfDay())
+                ? now : weekStart.atStartOfDay();
+        List<TimeSlot> busy = new ArrayList<>();
+        kept.forEach(session ->
+                busy.add(new TimeSlot(session.getStartDateTime(), session.getEndDateTime())));
+        List<WeeklyPeriod> periods = repository.getPeriods();
+        List<TimeSlot> slots = scheduler.getAvailableSlots(periods, weekStart, notBefore, busy);
+
+        List<AcademicTask> tasks = new ArrayList<>();
+        Map<String, Integer> studied = new HashMap<>();
+        for (AcademicTask task : repository.getTasks()) {
+            if (!task.isArchived() && !task.isCompleted() && task.getRemainingMinutes() > 0) {
+                tasks.add(task);
+            }
+            int minutes = 0;
+            for (StudySession session : repository.getSessionsForTask(task.getId())) {
+                minutes += session.getActualMinutes();
+            }
+            studied.put(task.getId(), minutes);
+        }
+        return new PlanningContext(weekStart, now, revision, tasks, periods, slots, studied);
+    }
+
+    private PlanProposal toProposal(StudyPlan base, boolean revision, List<StudySession> kept,
+                                    AgentResult result, LocalDate weekStart) {
+        StudyPlan plan = new StudyPlan(base.getId(), weekStart, base.isAccepted(), false,
+                result.explanation(), result.schedule().unscheduledMinutes(), kept);
+        Set<String> newIds = new LinkedHashSet<>();
+        for (StudySession session : result.schedule().sessions()) {
+            plan.addSession(session);
+            newIds.add(session.getId());
+        }
+        return new PlanProposal(plan, revision, fingerprint(weekStart), newIds);
+    }
+
+    // A summary of every stored value planning depends on, to detect changes before accepting.
+    private String fingerprint(LocalDate weekStart) {
+        StringBuilder state = new StringBuilder();
+        repository.getTasks().stream().sorted(Comparator.comparing(AcademicTask::getId))
+                .forEach(task -> state.append("T|").append(task.getId()).append('|')
+                        .append(task.getDeadline()).append('|').append(task.getPriority()).append('|')
+                        .append(task.getRemainingMinutes()).append('|').append(task.isCompleted())
+                        .append('|').append(task.isArchived()).append('\n'));
+        repository.getPeriods().stream().sorted(Comparator.comparing(WeeklyPeriod::getId))
+                .forEach(period -> state.append("P|").append(period.getId()).append('|')
+                        .append(period.getDayOfWeek()).append('|').append(period.getStartTime())
+                        .append('|').append(period.getEndTime()).append('|')
+                        .append(period.getType()).append('\n'));
+        for (StudyPlan plan : repository.getPlans(weekStart)) {
+            state.append("L|").append(plan.getId()).append('|').append(plan.isAccepted())
+                    .append('|').append(plan.needsRevision()).append('\n');
+            plan.getSessions().stream().sorted(Comparator.comparing(StudySession::getId))
+                    .forEach(session -> state.append("S|").append(session.getId()).append('|')
+                            .append(session.getStartDateTime()).append('|')
+                            .append(session.getEndDateTime()).append('|')
+                            .append(session.getStatus()).append('|')
+                            .append(session.getActualMinutes()).append('\n'));
+        }
+        try {
+            byte[] hash = MessageDigest.getInstance("SHA-256")
+                    .digest(state.toString().getBytes(StandardCharsets.UTF_8));
+            return HexFormat.of().formatHex(hash);
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 is not available.", e);
+        }
     }
 
     // ----- Helpers -----

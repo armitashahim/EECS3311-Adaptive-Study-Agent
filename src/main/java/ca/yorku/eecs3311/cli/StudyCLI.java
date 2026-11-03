@@ -7,7 +7,9 @@ import ca.yorku.eecs3311.application.PlanProposal;
 import ca.yorku.eecs3311.application.StudyApplication;
 import ca.yorku.eecs3311.config.AppConfig;
 import ca.yorku.eecs3311.model.AcademicTask;
+import ca.yorku.eecs3311.material.PdfImportException;
 import ca.yorku.eecs3311.model.Course;
+import ca.yorku.eecs3311.model.CourseMaterial;
 import ca.yorku.eecs3311.model.StudyPlan;
 import ca.yorku.eecs3311.model.StudySession;
 import ca.yorku.eecs3311.model.WeeklyPeriod;
@@ -43,6 +45,7 @@ public class StudyCLI {
     private static final DateTimeFormatter DATE_TIME =
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm");
     private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("HH:mm");
+    private static final int MATERIAL_PREVIEW_CHARACTERS = 800;
 
     private final StudyApplication application;
     private final BufferedReader input;
@@ -119,6 +122,10 @@ public class StudyCLI {
                 case "task-add" -> addTask(args);
                 case "task-edit" -> editTask(args);
                 case "task-remove" -> removeTask(args);
+                case "materials" -> listMaterials(args);
+                case "material-import" -> importMaterial(args);
+                case "material-show" -> showMaterial(args);
+                case "material-remove" -> removeMaterial(args);
                 case "periods" -> listPeriods();
                 case "period-add" -> addPeriod(args);
                 case "period-remove" -> removePeriod(args);
@@ -135,6 +142,9 @@ public class StudyCLI {
             }
         } catch (IllegalArgumentException | IllegalStateException | DateTimeParseException e) {
             output.println("Error: " + e.getMessage());
+        } catch (PdfImportException e) {
+            output.println("Import failed: " + e.getMessage());
+            output.println("No material was saved.");
         } catch (AgentException e) {
             output.println("The AI assistant could not produce a plan: " + e.getMessage());
             output.println("Nothing was changed.");
@@ -158,6 +168,11 @@ public class StudyCLI {
                   task-add N TITLE TYPE YYYY-MM-DD HH:mm PRIORITY MINUTES
                   task-edit N T TITLE TYPE YYYY-MM-DD HH:mm PRIORITY
                   task-remove N T                      archive task T of course N
+                Course materials (F08)
+                  materials N                          list materials of course N
+                  material-import N TITLE PDF_PATH     import a text-based PDF
+                  material-show N M                    show the start of material M's text
+                  material-remove N M                  delete material M
                 Availability and commitments (F02)
                   periods                              list weekly periods
                   period-add availability|commitment DAY HH:mm HH:mm
@@ -253,6 +268,49 @@ public class StudyCLI {
         AcademicTask task = taskAt(courseAt(args.get(0)), args.get(1));
         application.removeTask(task.getId());
         output.println("Task removed. Its future sessions were dropped and past records kept.");
+    }
+
+    private void listMaterials(List<String> args) {
+        requireArgs(args, 1, "materials N");
+        Course course = courseAt(args.get(0));
+        List<CourseMaterial> materials = application.getMaterials(course.getId());
+        if (materials.isEmpty()) {
+            output.println("No materials in " + course.getName() + ".");
+            return;
+        }
+        for (int i = 0; i < materials.size(); i++) {
+            output.printf("%d. %s (%d characters)%n", i + 1, materials.get(i).getTitle(),
+                    materials.get(i).getText().length());
+        }
+    }
+
+    private void importMaterial(List<String> args) throws IOException, PdfImportException {
+        requireArgs(args, 3, "material-import N TITLE PDF_PATH");
+        Course course = courseAt(args.get(0));
+        CourseMaterial material = application.importMaterial(
+                course.getId(), args.get(1), Path.of(args.get(2)));
+        output.printf("Imported '%s' (%d characters).%n", material.getTitle(),
+                material.getText().length());
+    }
+
+    private void showMaterial(List<String> args) {
+        requireArgs(args, 2, "material-show N M");
+        CourseMaterial material = materialAt(courseAt(args.get(0)), args.get(1));
+        String text = application.getMaterial(material.getId()).getText();
+        output.println(material.getTitle() + ":");
+        if (text.length() > MATERIAL_PREVIEW_CHARACTERS) {
+            output.println(text.substring(0, MATERIAL_PREVIEW_CHARACTERS) + "...");
+            output.printf("(%d more characters)%n", text.length() - MATERIAL_PREVIEW_CHARACTERS);
+        } else {
+            output.println(text);
+        }
+    }
+
+    private void removeMaterial(List<String> args) throws IOException {
+        requireArgs(args, 2, "material-remove N M");
+        CourseMaterial material = materialAt(courseAt(args.get(0)), args.get(1));
+        application.removeMaterial(material.getId());
+        output.println("Material removed.");
     }
 
     private void listPeriods() {
@@ -403,6 +461,10 @@ public class StudyCLI {
 
     private Course courseAt(String number) {
         return pick(application.getCourses(), number, "course");
+    }
+
+    private CourseMaterial materialAt(Course course, String number) {
+        return pick(application.getMaterials(course.getId()), number, "material");
     }
 
     private AcademicTask taskAt(Course course, String number) {

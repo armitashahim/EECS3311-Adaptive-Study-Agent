@@ -10,7 +10,10 @@ import ca.yorku.eecs3311.estimation.DurationEstimator;
 import ca.yorku.eecs3311.estimation.HistoricalDurationStrategy;
 import ca.yorku.eecs3311.estimation.OriginalDurationStrategy;
 import ca.yorku.eecs3311.model.AcademicTask;
+import ca.yorku.eecs3311.material.PdfImportException;
+import ca.yorku.eecs3311.material.PdfImporter;
 import ca.yorku.eecs3311.model.Course;
+import ca.yorku.eecs3311.model.CourseMaterial;
 import ca.yorku.eecs3311.model.StudyPlan;
 import ca.yorku.eecs3311.model.StudySession;
 import ca.yorku.eecs3311.model.TimeSlot;
@@ -20,6 +23,7 @@ import ca.yorku.eecs3311.scheduling.ScheduleResult;
 import ca.yorku.eecs3311.scheduling.Scheduler;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Clock;
@@ -42,13 +46,14 @@ import java.util.Set;
  * and keeps related updates together in one atomic repository commit.
  *
  * This version covers courses and tasks (F01), weekly availability (F02),
- * study progress (F06), duration estimates (F07) and AI-assisted weekly
- * planning and revision (F04, F05).
+ * study progress (F06), duration estimates (F07), AI-assisted weekly
+ * planning and revision (F04, F05) and course materials (F08).
  */
 public class StudyApplication {
     private final LocalRepository repository;
     private final Clock clock;
     private final LLMClient llm;
+    private final PdfImporter pdfImporter;
     private final DurationEstimator durationEstimator = new DurationEstimator();
     private final Scheduler scheduler = new Scheduler();
 
@@ -62,6 +67,15 @@ public class StudyApplication {
 
     // The LLM client may be null; planning then reports that AI is not configured.
     public StudyApplication(LocalRepository repository, Clock clock, LLMClient llm) {
+        this(repository, clock, llm, new PdfImporter());
+    }
+
+    public StudyApplication(LocalRepository repository, Clock clock, LLMClient llm,
+                            PdfImporter pdfImporter) {
+        if (pdfImporter == null) {
+            throw new IllegalArgumentException("PDF importer is required.");
+        }
+
         if (repository == null) {
             throw new IllegalArgumentException("Repository is required.");
         }
@@ -73,6 +87,7 @@ public class StudyApplication {
         this.repository = repository;
         this.clock = clock;
         this.llm = llm;
+        this.pdfImporter = pdfImporter;
     }
 
     // ----- F01: courses and tasks -----
@@ -543,6 +558,41 @@ public class StudyApplication {
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("SHA-256 is not available.", e);
         }
+    }
+
+    // ----- F08: course materials -----
+
+    /**
+     * Import a text-based PDF as a course material. The course and title are checked
+     * first, then the PDF is validated and read; a failed import saves nothing.
+     */
+    public CourseMaterial importMaterial(String courseId, String title, Path pdf)
+            throws PdfImportException, IOException {
+        if (courseId == null || courseId.isBlank()) {
+            throw new IllegalArgumentException("Course ID cannot be empty.");
+        }
+
+        if (title == null || title.isBlank()) {
+            throw new IllegalArgumentException("Material title cannot be empty.");
+        }
+
+        Course course = repository.getCourse(courseId);
+        String text = pdfImporter.extractText(pdf);
+        CourseMaterial material = new CourseMaterial(course, title, text);
+        repository.saveMaterial(material);
+        return material;
+    }
+
+    public List<CourseMaterial> getMaterials(String courseId) {
+        return repository.getMaterials(courseId);
+    }
+
+    public CourseMaterial getMaterial(String materialId) {
+        return repository.getMaterial(materialId);
+    }
+
+    public void removeMaterial(String materialId) throws IOException {
+        repository.deleteMaterial(materialId);
     }
 
     // ----- Helpers -----

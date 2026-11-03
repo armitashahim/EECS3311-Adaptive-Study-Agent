@@ -2,6 +2,7 @@ package ca.yorku.eecs3311.repository;
 
 import ca.yorku.eecs3311.model.AcademicTask;
 import ca.yorku.eecs3311.model.Course;
+import ca.yorku.eecs3311.model.CourseMaterial;
 import ca.yorku.eecs3311.model.StudyPlan;
 import ca.yorku.eecs3311.model.StudySession;
 import ca.yorku.eecs3311.model.WeeklyPeriod;
@@ -198,6 +199,38 @@ public class LocalRepository {
         return List.copyOf(result);
     }
 
+    // ----- Course materials -----
+
+    public synchronized void saveMaterial(CourseMaterial material) throws IOException {
+        commit(draft -> draft.saveMaterial(material));
+    }
+
+    public synchronized void deleteMaterial(String materialId) throws IOException {
+        commit(draft -> draft.deleteMaterial(materialId));
+    }
+
+    public synchronized List<CourseMaterial> getMaterials(String courseId) {
+        if (courseId == null || courseId.isBlank()) {
+            throw new IllegalArgumentException("Course ID cannot be empty.");
+        }
+
+        List<CourseMaterial> result = new ArrayList<>();
+        for (CourseMaterial material : state.materials.values()) {
+            if (material.getCourse().getId().equals(courseId)) {
+                result.add(copyMaterial(material, state.courses.get(courseId)));
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    public synchronized CourseMaterial getMaterial(String id) {
+        CourseMaterial material = state.materials.get(id);
+        if (material == null) {
+            throw new IllegalArgumentException("Material not found: " + id);
+        }
+        return copyMaterial(material, state.courses.get(material.getCourse().getId()));
+    }
+
     public synchronized void saveSession(StudySession session) throws IOException {
         commit(draft -> draft.saveSession(session));
     }
@@ -264,7 +297,13 @@ public class LocalRepository {
                 }
             }
 
-            // Also reject deletion when course-material storage is added and materials exist.
+            for (CourseMaterial material : working.materials.values()) {
+                if (material.getCourse().getId().equals(courseId)) {
+                    throw new IllegalArgumentException(
+                            "Cannot delete course while materials belong to it: " + courseId);
+                }
+            }
+
             working.courses.remove(courseId);
         }
 
@@ -321,6 +360,32 @@ public class LocalRepository {
             working.plans.put(copy.getId(), copy);
         }
 
+        public void saveMaterial(CourseMaterial material) {
+            requireOpen();
+            Objects.requireNonNull(material, "Material is required.");
+
+            Course repositoryCourse = working.courses.get(material.getCourse().getId());
+            if (repositoryCourse == null) {
+                throw new IllegalArgumentException(
+                        "Cannot save material: course not found in repository: "
+                                + material.getCourse().getId());
+            }
+
+            CourseMaterial copy = copyMaterial(material, repositoryCourse);
+            working.materials.put(copy.getId(), copy);
+        }
+
+        public void deleteMaterial(String materialId) {
+            requireOpen();
+            if (materialId == null || materialId.isBlank()) {
+                throw new IllegalArgumentException("Material ID cannot be empty.");
+            }
+
+            if (working.materials.remove(materialId) == null) {
+                throw new IllegalArgumentException("Material not found: " + materialId);
+            }
+        }
+
         /** Update a session that already belongs to a saved plan. */
         public void saveSession(StudySession session) {
             requireOpen();
@@ -361,6 +426,7 @@ public class LocalRepository {
         final Map<String, AcademicTask> tasks = new LinkedHashMap<>();
         final Map<String, WeeklyPeriod> periods = new LinkedHashMap<>();
         final Map<String, StudyPlan> plans = new LinkedHashMap<>();
+        final Map<String, CourseMaterial> materials = new LinkedHashMap<>();
 
         State copy() {
             State result = new State();
@@ -379,6 +445,11 @@ public class LocalRepository {
             for (StudyPlan plan : plans.values()) {
                 StudyPlan copy = copyPlan(plan);
                 result.plans.put(copy.getId(), copy);
+            }
+            for (CourseMaterial material : materials.values()) {
+                CourseMaterial copy = copyMaterial(
+                        material, result.courses.get(material.getCourse().getId()));
+                result.materials.put(copy.getId(), copy);
             }
             return result;
         }
@@ -420,6 +491,7 @@ public class LocalRepository {
         // Files written before planning data existed have no periods or plans.
         JsonArray periodRecords = optionalArray(root, "periods");
         JsonArray planRecords = optionalArray(root, "plans");
+        JsonArray materialRecords = optionalArray(root, "materials");
 
         State loaded = new State();
 
@@ -488,6 +560,30 @@ public class LocalRepository {
                     "plans[" + i + "]", loaded.tasks, sessionIds);
             if (loaded.plans.putIfAbsent(plan.getId(), plan) != null) {
                 throw malformed("Duplicate plan ID: " + plan.getId());
+            }
+        }
+
+        for (int i = 0; i < materialRecords.size(); i++) {
+            String location = "materials[" + i + "]";
+            JsonObject record = requireObject(materialRecords.get(i), location);
+            String id = requireString(record, "id", location);
+            String courseId = requireString(record, "courseId", location);
+            Course course = loaded.courses.get(courseId);
+            if (course == null) {
+                throw malformed("Material " + id + " references missing course: " + courseId);
+            }
+
+            String title = requireString(record, "title", location);
+            String text = requireString(record, "text", location);
+            CourseMaterial material;
+            try {
+                material = new CourseMaterial(id, course, title, text);
+            } catch (IllegalArgumentException exception) {
+                throw malformed("Invalid material at " + location + ": "
+                        + exception.getMessage(), exception);
+            }
+            if (loaded.materials.putIfAbsent(material.getId(), material) != null) {
+                throw malformed("Duplicate material ID: " + material.getId());
             }
         }
 
@@ -680,10 +776,21 @@ public class LocalRepository {
             planRecords.add(record);
         }
 
+        JsonArray materialRecords = new JsonArray();
+        for (CourseMaterial material : toWrite.materials.values()) {
+            JsonObject record = new JsonObject();
+            record.addProperty("id", material.getId());
+            record.addProperty("courseId", material.getCourse().getId());
+            record.addProperty("title", material.getTitle());
+            record.addProperty("text", material.getText());
+            materialRecords.add(record);
+        }
+
         root.add("courses", courseRecords);
         root.add("tasks", taskRecords);
         root.add("periods", periodRecords);
         root.add("plans", planRecords);
+        root.add("materials", materialRecords);
         return root;
     }
 
@@ -802,6 +909,11 @@ public class LocalRepository {
                 task.getRemainingMinutes(),
                 task.isCompleted(),
                 task.isArchived());
+    }
+
+    private static CourseMaterial copyMaterial(CourseMaterial material, Course course) {
+        return new CourseMaterial(material.getId(), copyCourse(course),
+                material.getTitle(), material.getText());
     }
 
     private static WeeklyPeriod copyPeriod(WeeklyPeriod period) {

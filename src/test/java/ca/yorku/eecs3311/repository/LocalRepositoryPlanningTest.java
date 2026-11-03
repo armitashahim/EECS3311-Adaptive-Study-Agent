@@ -165,6 +165,21 @@ class LocalRepositoryPlanningTest {
     }
 
     @Test
+    void getPlansWithoutAWeekReturnsEveryPlanInOrder() throws IOException {
+        LocalRepository repository = new LocalRepository(file());
+        StudyPlan first = new StudyPlan(WEEK);
+        StudyPlan second = new StudyPlan(WEEK.plusDays(7));
+        repository.savePlan(first);
+        repository.savePlan(second);
+
+        List<StudyPlan> plans = new LocalRepository(file()).getPlans();
+
+        assertEquals(2, plans.size());
+        assertEquals(first.getId(), plans.get(0).getId());
+        assertEquals(second.getId(), plans.get(1).getId());
+    }
+
+    @Test
     void savedAndReturnedPlansAreCopies() throws IOException {
         LocalRepository repository = new LocalRepository(file());
         AcademicTask task = saveCourseAndTask(repository);

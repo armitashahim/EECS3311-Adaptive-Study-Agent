@@ -176,6 +176,14 @@ public class LocalRepository {
         commit(draft -> draft.savePlan(plan));
     }
 
+    public synchronized List<StudyPlan> getPlans() {
+        List<StudyPlan> result = new ArrayList<>();
+        for (StudyPlan plan : state.plans.values()) {
+            result.add(copyPlan(plan));
+        }
+        return List.copyOf(result);
+    }
+
     public synchronized List<StudyPlan> getPlans(LocalDate weekStart) {
         if (weekStart == null) {
             throw new IllegalArgumentException("Week start date is required.");

@@ -9,3 +9,4 @@ config.local.json
 target/
 build/
 out/
+data/

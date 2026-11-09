@@ -1,13 +1,12 @@
 package ca.yorku.eecs3311.agent;
 
 import ca.yorku.eecs3311.ai.LLMClient;
+import ca.yorku.eecs3311.ai.JsonReplies;
 import ca.yorku.eecs3311.ai.LLMException;
 import ca.yorku.eecs3311.scheduling.ScheduleResult;
 import ca.yorku.eecs3311.scheduling.Scheduler;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
-import com.google.gson.JsonParseException;
-import com.google.gson.JsonParser;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -151,24 +150,10 @@ public class StudyAgent {
 
     /** Finds the JSON object in a reply, tolerating code fences and surrounding text. */
     static JsonObject parseAction(String reply) {
-        if (reply == null) {
-            return null;
-        }
-        int start = reply.indexOf('{');
-        int end = reply.lastIndexOf('}');
-        if (start < 0 || end <= start) {
-            return null;
-        }
-        try {
-            JsonElement parsed = JsonParser.parseString(reply.substring(start, end + 1));
-            return parsed.isJsonObject() ? parsed.getAsJsonObject() : null;
-        } catch (JsonParseException e) {
-            return null;
-        }
+        return JsonReplies.extractObject(reply);
     }
 
     private static String text(JsonObject object, String key) {
-        JsonElement value = object.get(key);
-        return value != null && value.isJsonPrimitive() ? value.getAsString() : "";
+        return JsonReplies.text(object, key);
     }
 }

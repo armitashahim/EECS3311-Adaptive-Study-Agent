@@ -10,6 +10,12 @@ import ca.yorku.eecs3311.model.AcademicTask;
 import ca.yorku.eecs3311.material.PdfImportException;
 import ca.yorku.eecs3311.model.Course;
 import ca.yorku.eecs3311.model.CourseMaterial;
+import ca.yorku.eecs3311.model.Quiz;
+import ca.yorku.eecs3311.model.QuizQuestion;
+import ca.yorku.eecs3311.quiz.QuizException;
+import ca.yorku.eecs3311.review.ReviewException;
+import ca.yorku.eecs3311.review.ReviewRecommendation;
+import ca.yorku.eecs3311.review.TopicStats;
 import ca.yorku.eecs3311.model.StudyPlan;
 import ca.yorku.eecs3311.model.StudySession;
 import ca.yorku.eecs3311.model.WeeklyPeriod;
@@ -55,6 +61,10 @@ public class StudyCLI {
     private final Clock clock;
     private PlanProposal pendingProposal;
     private List<TaskDraft> pendingDrafts = new ArrayList<>();
+    private Quiz currentQuiz;
+    private final Integer[] currentAnswers = new Integer[Quiz.QUESTION_COUNT];
+    private List<ReviewRecommendation> pendingRecommendations = new ArrayList<>();
+    private String pendingRecommendationCourseId;
     private String pendingDraftCourseId;
 
     public StudyCLI(StudyApplication application, InputStream input, PrintStream output,
@@ -136,6 +146,15 @@ public class StudyCLI {
                 case "material-import" -> importMaterial(args);
                 case "material-show" -> showMaterial(args);
                 case "material-remove" -> removeMaterial(args);
+                case "quiz-generate" -> generateQuiz(args);
+                case "quiz" -> showQuiz();
+                case "quiz-answer" -> answerQuiz(args);
+                case "quiz-submit" -> submitQuiz(args);
+                case "quiz-cancel" -> cancelQuiz();
+                case "quiz-history" -> showQuizHistory(args);
+                case "topics" -> showTopics(args);
+                case "recommend" -> recommend(args);
+                case "recommend-accept" -> acceptRecommendation(args);
                 case "periods" -> listPeriods();
                 case "period-add" -> addPeriod(args);
                 case "period-remove" -> removePeriod(args);
@@ -155,6 +174,12 @@ public class StudyCLI {
         } catch (SyllabusException e) {
             output.println("Could not read tasks from the syllabus: " + e.getMessage());
             output.println("No tasks were saved. You can add tasks yourself with task-add.");
+        } catch (QuizException e) {
+            output.println("Could not create a quiz: " + e.getMessage());
+            output.println("Nothing was saved.");
+        } catch (ReviewException e) {
+            output.println("Could not get recommendations: " + e.getMessage());
+            output.println("Nothing was changed.");
         } catch (PdfImportException e) {
             output.println("Import failed: " + e.getMessage());
             output.println("No material was saved.");
@@ -194,6 +219,18 @@ public class StudyCLI {
                   material-import N TITLE PDF_PATH     import a text-based PDF
                   material-show N M                    show the start of material M's text
                   material-remove N M                  delete material M
+                Practice quizzes (F09) - uses the AI assistant
+                  quiz-generate N M TOPIC              make a 5-question quiz on TOPIC from material M
+                  quiz                                 show the current quiz
+                  quiz-answer Q CHOICE                 answer question Q with A, B, C or D
+                  quiz-submit [confirm]                score it ('confirm' to submit unanswered questions)
+                  quiz-cancel                          leave the quiz without submitting
+                  quiz-history N                       past results of course N
+                Review recommendations (F10) - uses the AI assistant
+                  topics N                             accuracy per topic (weak: under 60% over 5+ answers)
+                  recommend N                          propose review tasks for weak topics
+                  recommend-accept R MINUTES YYYY-MM-DD HH:mm PRIORITY
+                                                       create the review task R as a normal task
                 Availability and commitments (F02)
                   periods                              list weekly periods
                   period-add availability|commitment DAY HH:mm HH:mm
@@ -415,6 +452,148 @@ public class StudyCLI {
         CourseMaterial material = materialAt(courseAt(args.get(0)), args.get(1));
         application.removeMaterial(material.getId());
         output.println("Material removed.");
+    }
+
+    private void generateQuiz(List<String> args) throws QuizException, IOException {
+        requireArgs(args, 3, "quiz-generate N M TOPIC");
+        Course course = courseAt(args.get(0));
+        CourseMaterial material = materialAt(course, args.get(1));
+        output.println("Asking the AI assistant for a quiz...");
+        currentQuiz = application.generateQuiz(course.getId(), material.getId(), args.get(2));
+        java.util.Arrays.fill(currentAnswers, null);
+        output.println("Quiz ready: " + currentQuiz.getTopic() + " (answers are hidden until you submit).");
+        printQuestions();
+    }
+
+    private void showQuiz() {
+        requireQuiz();
+        printQuestions();
+    }
+
+    private void printQuestions() {
+        List<QuizQuestion> questions = currentQuiz.getQuestions();
+        for (int i = 0; i < questions.size(); i++) {
+            output.printf("Q%d. %s%s%n", i + 1, questions.get(i).getText(),
+                    currentAnswers[i] == null ? "" : "  [your answer: "
+                            + (char) ('A' + currentAnswers[i]) + "]");
+            for (int c = 0; c < questions.get(i).getChoices().size(); c++) {
+                output.printf("   %c. %s%n", (char) ('A' + c), questions.get(i).getChoices().get(c));
+            }
+        }
+    }
+
+    private void answerQuiz(List<String> args) {
+        requireQuiz();
+        requireArgs(args, 2, "quiz-answer Q CHOICE");
+        int question = parseNumber(args.get(0), "question number");
+        if (question < 1 || question > Quiz.QUESTION_COUNT) {
+            throw new IllegalArgumentException("Questions are numbered 1 to " + Quiz.QUESTION_COUNT + ".");
+        }
+        String choice = args.get(1).trim().toUpperCase(Locale.ROOT);
+        if (choice.length() != 1 || choice.charAt(0) < 'A' || choice.charAt(0) > 'D') {
+            throw new IllegalArgumentException("Choose A, B, C or D.");
+        }
+        currentAnswers[question - 1] = choice.charAt(0) - 'A';
+        output.println("Answer " + choice + " recorded for question " + question + ".");
+    }
+
+    private void submitQuiz(List<String> args) throws IOException {
+        requireQuiz();
+        boolean confirm = !args.isEmpty() && args.get(0).equalsIgnoreCase("confirm");
+        Quiz result = application.submitQuiz(currentQuiz.getId(),
+                java.util.Arrays.asList(currentAnswers), confirm);
+        output.printf("Score: %d out of %d (topic: %s).%n", result.getScore(),
+                Quiz.QUESTION_COUNT, result.getTopic());
+        printResults(result);
+        currentQuiz = null;
+        java.util.Arrays.fill(currentAnswers, null);
+    }
+
+    private void printResults(Quiz quiz) {
+        for (int i = 0; i < quiz.getQuestions().size(); i++) {
+            QuizQuestion question = quiz.getQuestions().get(i);
+            Integer answer = quiz.getAnswers().get(i);
+            String mark = answer == null ? "no answer" : answer == question.getCorrectIndex()
+                    ? "correct" : "wrong (you chose " + (char) ('A' + answer) + ")";
+            output.printf("Q%d: %s. Correct answer: %c. %s%n", i + 1, mark,
+                    (char) ('A' + question.getCorrectIndex()), question.getExplanation());
+        }
+    }
+
+    private void cancelQuiz() {
+        currentQuiz = null;
+        java.util.Arrays.fill(currentAnswers, null);
+        output.println("Quiz closed. No attempt was recorded.");
+    }
+
+    private void showQuizHistory(List<String> args) {
+        requireArgs(args, 1, "quiz-history N");
+        Course course = courseAt(args.get(0));
+        List<Quiz> history = application.getQuizHistory(course.getId());
+        if (history.isEmpty()) {
+            output.println("No submitted quizzes in " + course.getName() + ".");
+            return;
+        }
+        for (int i = 0; i < history.size(); i++) {
+            Quiz quiz = history.get(i);
+            output.printf("%d. %s - %s - %d/%d (%d answered)%n", i + 1,
+                    quiz.getCreatedAt().format(DATE_TIME), quiz.getTopic(), quiz.getScore(),
+                    Quiz.QUESTION_COUNT, quiz.getAnsweredCount());
+        }
+    }
+
+    private void showTopics(List<String> args) {
+        requireArgs(args, 1, "topics N");
+        Course course = courseAt(args.get(0));
+        List<TopicStats> stats = application.getTopicStats(course.getId());
+        if (stats.isEmpty()) {
+            output.println("No submitted quizzes in " + course.getName() + " yet.");
+            return;
+        }
+        for (TopicStats topic : stats) {
+            output.printf("%s: %d/%d correct (%.0f%%)%s%n", topic.topic(), topic.correct(),
+                    topic.answered(), topic.accuracy() * 100,
+                    topic.isWeak() ? "  <- needs review"
+                            : topic.answered() < TopicStats.MIN_ANSWERED
+                            ? "  (needs " + TopicStats.MIN_ANSWERED + "+ answers to judge)" : "");
+        }
+    }
+
+    private void recommend(List<String> args) throws ReviewException {
+        requireArgs(args, 1, "recommend N");
+        Course course = courseAt(args.get(0));
+        List<ReviewRecommendation> found = application.getTopicStats(course.getId()).stream()
+                .anyMatch(TopicStats::isWeak) ? application.recommendReviews(course.getId()) : List.of();
+        pendingRecommendations = new ArrayList<>(found);
+        pendingRecommendationCourseId = course.getId();
+        if (found.isEmpty()) {
+            output.println("No weak topics in " + course.getName()
+                    + ". A topic is weak below 60% accuracy over at least 5 answered questions.");
+            return;
+        }
+        for (int i = 0; i < found.size(); i++) {
+            ReviewRecommendation r = found.get(i);
+            output.printf("%d. %s (topic %s: %d/%d correct) - about %d min%n   %s%n   Material: %s%n",
+                    i + 1, r.title(), r.stats().topic(), r.stats().correct(), r.stats().answered(),
+                    r.suggestedMinutes(), r.focus(), r.materialTitle());
+        }
+        output.println("Nothing is saved. Use recommend-accept R MINUTES YYYY-MM-DD HH:mm PRIORITY.");
+    }
+
+    private void acceptRecommendation(List<String> args) throws IOException {
+        requireArgs(args, 5, "recommend-accept R MINUTES YYYY-MM-DD HH:mm PRIORITY");
+        ReviewRecommendation r = pick(pendingRecommendations, args.get(0), "recommendation");
+        AcademicTask task = application.acceptRecommendation(pendingRecommendationCourseId, r,
+                parseDateTime(args.get(2), args.get(3)), parseNumber(args.get(1), "minutes"),
+                parseNumber(args.get(4), "priority"));
+        pendingRecommendations.remove(r);
+        output.println("Review task added: " + task.getTitle() + ". Schedule it with plan-generate.");
+    }
+
+    private void requireQuiz() {
+        if (currentQuiz == null) {
+            throw new IllegalStateException("There is no quiz in progress. Start one with quiz-generate.");
+        }
     }
 
     private void listPeriods() {

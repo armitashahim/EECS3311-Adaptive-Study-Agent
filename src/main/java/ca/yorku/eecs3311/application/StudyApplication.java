@@ -14,6 +14,13 @@ import ca.yorku.eecs3311.material.PdfImportException;
 import ca.yorku.eecs3311.material.PdfImporter;
 import ca.yorku.eecs3311.model.Course;
 import ca.yorku.eecs3311.model.CourseMaterial;
+import ca.yorku.eecs3311.model.Quiz;
+import ca.yorku.eecs3311.quiz.QuizException;
+import ca.yorku.eecs3311.quiz.QuizService;
+import ca.yorku.eecs3311.review.ReviewException;
+import ca.yorku.eecs3311.review.ReviewRecommendation;
+import ca.yorku.eecs3311.review.ReviewService;
+import ca.yorku.eecs3311.review.TopicStats;
 import ca.yorku.eecs3311.model.StudyPlan;
 import ca.yorku.eecs3311.model.StudySession;
 import ca.yorku.eecs3311.model.TimeSlot;
@@ -775,5 +782,120 @@ public class StudyApplication {
                     completed.getOriginalEstimatedMinutes(), actualMinutes));
         }
         return history;
+    }
+
+    // ----- F09: practice quizzes -----
+
+    /**
+     * Ask the AI for a five-question quiz on a topic of one material. The quiz is saved
+     * (unsubmitted) only if the AI's answer passes every structural check. A topic label
+     * that differs only in letter case from an earlier one reuses the earlier label, so
+     * results group consistently.
+     */
+    public Quiz generateQuiz(String courseId, String materialId, String topic)
+            throws QuizException, IOException {
+        if (courseId == null || courseId.isBlank()) {
+            throw new IllegalArgumentException("Course ID cannot be empty.");
+        }
+        if (materialId == null || materialId.isBlank()) {
+            throw new IllegalArgumentException("Please select a material.");
+        }
+        if (topic == null || topic.isBlank()) {
+            throw new IllegalArgumentException("Please enter a topic for the quiz.");
+        }
+        requireLlm();
+        Course course = repository.getCourse(courseId);
+        CourseMaterial material = repository.getMaterial(materialId);
+        if (!material.getCourse().getId().equals(courseId)) {
+            throw new IllegalArgumentException("That material belongs to a different course.");
+        }
+        String label = topic.strip();
+        for (Quiz earlier : repository.getQuizzes(courseId)) {
+            if (earlier.getTopic().equalsIgnoreCase(label)) {
+                label = earlier.getTopic();
+                break;
+            }
+        }
+        Quiz quiz = new QuizService(llm).generate(course, material, label,
+                LocalDateTime.now(clock));
+        repository.saveQuiz(quiz);
+        return quiz;
+    }
+
+    /**
+     * Score and save the single attempt. Each entry of {@code answers} is the chosen
+     * choice index (0-3) or null. Unanswered questions need {@code confirmUnanswered}
+     * and receive no credit.
+     */
+    public Quiz submitQuiz(String quizId, List<Integer> answers, boolean confirmUnanswered)
+            throws IOException {
+        Quiz quiz = repository.getQuiz(quizId);
+        if (quiz.isSubmitted()) {
+            throw new IllegalStateException("This quiz was already submitted.");
+        }
+        if (answers == null || answers.size() != Quiz.QUESTION_COUNT) {
+            throw new IllegalArgumentException("Provide one answer slot for each question.");
+        }
+        int unanswered = quiz.getUnansweredCount(answers);
+        if (unanswered > 0 && !confirmUnanswered) {
+            throw new IllegalArgumentException(unanswered + " question(s) are unanswered. "
+                    + "Confirm to submit them with no credit.");
+        }
+        Quiz submitted = quiz.submit(answers);
+        repository.saveQuiz(submitted);
+        return submitted;
+    }
+
+    public Quiz getQuiz(String quizId) {
+        return repository.getQuiz(quizId);
+    }
+
+    /** Submitted quizzes of a course, oldest first. Quizzes never submitted are not history. */
+    public List<Quiz> getQuizHistory(String courseId) {
+        List<Quiz> history = new ArrayList<>();
+        for (Quiz quiz : repository.getQuizzes(courseId)) {
+            if (quiz.isSubmitted()) {
+                history.add(quiz);
+            }
+        }
+        history.sort(java.util.Comparator.comparing(Quiz::getCreatedAt));
+        return history;
+    }
+
+    // ----- F10: weak-topic review recommendations -----
+
+    /** Accuracy per topic from submitted quizzes (deterministic), weakest first. */
+    public List<TopicStats> getTopicStats(String courseId) {
+        return ReviewService.topicStats(repository.getQuizzes(courseId));
+    }
+
+    /** Ask the AI for a review task for each weak topic. Saves nothing. */
+    public List<ReviewRecommendation> recommendReviews(String courseId) throws ReviewException {
+        requireLlm();
+        ReviewService service = new ReviewService(llm);
+        List<ReviewRecommendation> recommendations = new ArrayList<>();
+        for (TopicStats stats : getTopicStats(courseId)) {
+            if (stats.isWeak()) {
+                recommendations.add(service.recommend(stats, repository.getMaterial(stats.materialId())));
+            }
+        }
+        return recommendations;
+    }
+
+    /** Accepting a recommendation creates an ordinary task through F01, ready for scheduling. */
+    public AcademicTask acceptRecommendation(String courseId, ReviewRecommendation recommendation,
+                                             LocalDateTime deadline, int minutes, int priority)
+            throws IOException {
+        if (recommendation == null) {
+            throw new IllegalArgumentException("A recommendation is required.");
+        }
+        if (deadline == null || !deadline.isAfter(LocalDateTime.now(clock))) {
+            throw new IllegalArgumentException("The deadline must be in the future.");
+        }
+        Course course = repository.getCourse(courseId);
+        AcademicTask task = new AcademicTask(course, recommendation.title(), "Review", deadline,
+                priority, minutes);
+        saveTask(courseId, task);
+        return task;
     }
 }

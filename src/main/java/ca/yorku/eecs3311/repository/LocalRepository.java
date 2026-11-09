@@ -3,6 +3,8 @@ package ca.yorku.eecs3311.repository;
 import ca.yorku.eecs3311.model.AcademicTask;
 import ca.yorku.eecs3311.model.Course;
 import ca.yorku.eecs3311.model.CourseMaterial;
+import ca.yorku.eecs3311.model.Quiz;
+import ca.yorku.eecs3311.model.QuizQuestion;
 import ca.yorku.eecs3311.model.StudyPlan;
 import ca.yorku.eecs3311.model.StudySession;
 import ca.yorku.eecs3311.model.WeeklyPeriod;
@@ -231,6 +233,34 @@ public class LocalRepository {
         return copyMaterial(material, state.courses.get(material.getCourse().getId()));
     }
 
+    // ----- Quizzes -----
+
+    public synchronized void saveQuiz(Quiz quiz) throws IOException {
+        commit(draft -> draft.saveQuiz(quiz));
+    }
+
+    public synchronized List<Quiz> getQuizzes(String courseId) {
+        if (courseId == null || courseId.isBlank()) {
+            throw new IllegalArgumentException("Course ID cannot be empty.");
+        }
+
+        List<Quiz> result = new ArrayList<>();
+        for (Quiz quiz : state.quizzes.values()) {
+            if (quiz.getCourse().getId().equals(courseId)) {
+                result.add(copyQuiz(quiz, state.courses.get(courseId)));
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    public synchronized Quiz getQuiz(String id) {
+        Quiz quiz = state.quizzes.get(id);
+        if (quiz == null) {
+            throw new IllegalArgumentException("Quiz not found: " + id);
+        }
+        return copyQuiz(quiz, state.courses.get(quiz.getCourse().getId()));
+    }
+
     public synchronized void saveSession(StudySession session) throws IOException {
         commit(draft -> draft.saveSession(session));
     }
@@ -301,6 +331,13 @@ public class LocalRepository {
                 if (material.getCourse().getId().equals(courseId)) {
                     throw new IllegalArgumentException(
                             "Cannot delete course while materials belong to it: " + courseId);
+                }
+            }
+
+            for (Quiz quiz : working.quizzes.values()) {
+                if (quiz.getCourse().getId().equals(courseId)) {
+                    throw new IllegalArgumentException(
+                            "Cannot delete course while quizzes belong to it: " + courseId);
                 }
             }
 
@@ -375,10 +412,41 @@ public class LocalRepository {
             working.materials.put(copy.getId(), copy);
         }
 
+        public void saveQuiz(Quiz quiz) {
+            requireOpen();
+            Objects.requireNonNull(quiz, "Quiz is required.");
+
+            Course repositoryCourse = working.courses.get(quiz.getCourse().getId());
+            if (repositoryCourse == null) {
+                throw new IllegalArgumentException(
+                        "Cannot save quiz: course not found in repository: "
+                                + quiz.getCourse().getId());
+            }
+            if (!working.materials.containsKey(quiz.getMaterialId())) {
+                throw new IllegalArgumentException(
+                        "Cannot save quiz: material not found in repository: "
+                                + quiz.getMaterialId());
+            }
+            Quiz existing = working.quizzes.get(quiz.getId());
+            if (existing != null && existing.isSubmitted()) {
+                throw new IllegalStateException("A submitted quiz cannot be changed.");
+            }
+
+            Quiz copy = copyQuiz(quiz, repositoryCourse);
+            working.quizzes.put(copy.getId(), copy);
+        }
+
         public void deleteMaterial(String materialId) {
             requireOpen();
             if (materialId == null || materialId.isBlank()) {
                 throw new IllegalArgumentException("Material ID cannot be empty.");
+            }
+
+            for (Quiz quiz : working.quizzes.values()) {
+                if (quiz.getMaterialId().equals(materialId)) {
+                    throw new IllegalArgumentException(
+                            "Cannot delete a material that saved quizzes were made from.");
+                }
             }
 
             if (working.materials.remove(materialId) == null) {
@@ -427,6 +495,7 @@ public class LocalRepository {
         final Map<String, WeeklyPeriod> periods = new LinkedHashMap<>();
         final Map<String, StudyPlan> plans = new LinkedHashMap<>();
         final Map<String, CourseMaterial> materials = new LinkedHashMap<>();
+        final Map<String, Quiz> quizzes = new LinkedHashMap<>();
 
         State copy() {
             State result = new State();
@@ -450,6 +519,10 @@ public class LocalRepository {
                 CourseMaterial copy = copyMaterial(
                         material, result.courses.get(material.getCourse().getId()));
                 result.materials.put(copy.getId(), copy);
+            }
+            for (Quiz quiz : quizzes.values()) {
+                Quiz copy = copyQuiz(quiz, result.courses.get(quiz.getCourse().getId()));
+                result.quizzes.put(copy.getId(), copy);
             }
             return result;
         }
@@ -492,6 +565,7 @@ public class LocalRepository {
         JsonArray periodRecords = optionalArray(root, "periods");
         JsonArray planRecords = optionalArray(root, "plans");
         JsonArray materialRecords = optionalArray(root, "materials");
+        JsonArray quizRecords = optionalArray(root, "quizzes");
 
         State loaded = new State();
 
@@ -587,7 +661,59 @@ public class LocalRepository {
             }
         }
 
+        for (int i = 0; i < quizRecords.size(); i++) {
+            String location = "quizzes[" + i + "]";
+            JsonObject record = requireObject(quizRecords.get(i), location);
+            Quiz quiz = parseQuiz(record, location, loaded);
+            if (loaded.quizzes.putIfAbsent(quiz.getId(), quiz) != null) {
+                throw malformed("Duplicate quiz ID: " + quiz.getId());
+            }
+        }
+
         state = loaded;
+    }
+
+    private static Quiz parseQuiz(JsonObject record, String location, State loaded) {
+        String id = requireString(record, "id", location);
+        String courseId = requireString(record, "courseId", location);
+        Course course = loaded.courses.get(courseId);
+        if (course == null) {
+            throw malformed("Quiz " + id + " references missing course: " + courseId);
+        }
+        String materialId = requireString(record, "materialId", location);
+        if (!loaded.materials.containsKey(materialId)) {
+            throw malformed("Quiz " + id + " references missing material: " + materialId);
+        }
+        String topic = requireString(record, "topic", location);
+        LocalDateTime createdAt = parseValue(requireString(record, "createdAt", location),
+                LocalDateTime::parse, "createdAt", location);
+        JsonElement submittedValue = record.get("submitted");
+        if (submittedValue == null || !submittedValue.isJsonPrimitive()
+                || !submittedValue.getAsJsonPrimitive().isBoolean()) {
+            throw malformed("Missing or invalid boolean 'submitted' at " + location);
+        }
+        try {
+            List<QuizQuestion> questions = new ArrayList<>();
+            JsonArray questionRecords = requireArray(record, "questions");
+            for (int i = 0; i < questionRecords.size(); i++) {
+                JsonObject q = requireObject(questionRecords.get(i), location + ".questions[" + i + "]");
+                List<String> choices = new ArrayList<>();
+                for (JsonElement choice : requireArray(q, "choices")) {
+                    choices.add(choice.getAsString());
+                }
+                questions.add(new QuizQuestion(requireString(q, "text", location), choices,
+                        q.get("correctIndex").getAsInt(), requireString(q, "explanation", location)));
+            }
+            List<Integer> answers = new ArrayList<>();
+            for (JsonElement answer : requireArray(record, "answers")) {
+                answers.add(answer.isJsonNull() ? null : answer.getAsInt());
+            }
+            return new Quiz(id, course, materialId, topic, createdAt, questions, answers,
+                    submittedValue.getAsBoolean());
+        } catch (IllegalArgumentException | IllegalStateException | NullPointerException
+                 | UnsupportedOperationException exception) {
+            throw malformed("Invalid quiz at " + location + ": " + exception.getMessage(), exception);
+        }
     }
 
     private static WeeklyPeriod parsePeriod(JsonObject record, String location) {
@@ -786,11 +912,45 @@ public class LocalRepository {
             materialRecords.add(record);
         }
 
+        JsonArray quizRecords = new JsonArray();
+        for (Quiz quiz : toWrite.quizzes.values()) {
+            JsonObject record = new JsonObject();
+            record.addProperty("id", quiz.getId());
+            record.addProperty("courseId", quiz.getCourse().getId());
+            record.addProperty("materialId", quiz.getMaterialId());
+            record.addProperty("topic", quiz.getTopic());
+            record.addProperty("createdAt", quiz.getCreatedAt().toString());
+            record.addProperty("submitted", quiz.isSubmitted());
+            JsonArray questionRecords = new JsonArray();
+            for (QuizQuestion question : quiz.getQuestions()) {
+                JsonObject q = new JsonObject();
+                q.addProperty("text", question.getText());
+                JsonArray choices = new JsonArray();
+                question.getChoices().forEach(choices::add);
+                q.add("choices", choices);
+                q.addProperty("correctIndex", question.getCorrectIndex());
+                q.addProperty("explanation", question.getExplanation());
+                questionRecords.add(q);
+            }
+            record.add("questions", questionRecords);
+            JsonArray answers = new JsonArray();
+            for (Integer answer : quiz.getAnswers()) {
+                if (answer == null) {
+                    answers.add(com.google.gson.JsonNull.INSTANCE);
+                } else {
+                    answers.add(answer);
+                }
+            }
+            record.add("answers", answers);
+            quizRecords.add(record);
+        }
+
         root.add("courses", courseRecords);
         root.add("tasks", taskRecords);
         root.add("periods", periodRecords);
         root.add("plans", planRecords);
         root.add("materials", materialRecords);
+        root.add("quizzes", quizRecords);
         return root;
     }
 
@@ -914,6 +1074,11 @@ public class LocalRepository {
     private static CourseMaterial copyMaterial(CourseMaterial material, Course course) {
         return new CourseMaterial(material.getId(), copyCourse(course),
                 material.getTitle(), material.getText());
+    }
+
+    private static Quiz copyQuiz(Quiz quiz, Course course) {
+        return new Quiz(quiz.getId(), copyCourse(course), quiz.getMaterialId(), quiz.getTopic(),
+                quiz.getCreatedAt(), quiz.getQuestions(), quiz.getAnswers(), quiz.isSubmitted());
     }
 
     private static WeeklyPeriod copyPeriod(WeeklyPeriod period) {

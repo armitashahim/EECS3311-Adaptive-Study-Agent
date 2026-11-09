@@ -21,7 +21,6 @@ import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JTabbedPane;
 import javax.swing.SwingUtilities;
-import javax.swing.UIManager;
 
 /**
  * Graphical view over {@link StudyApplication}, the same facade the CLI uses. Each tab is a
@@ -53,12 +52,31 @@ public class StudyGUI extends JFrame {
         addCourse.addActionListener(e -> GuiSupport.guard(this, this::addCourse));
         renameCourse.addActionListener(e -> GuiSupport.guard(this, this::renameCourse));
         removeCourse.addActionListener(e -> GuiSupport.guard(this, this::removeCourse));
-        JPanel top = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 6));
-        top.add(new JLabel("Course:"));
-        top.add(courses);
-        top.add(addCourse);
-        top.add(renameCourse);
-        top.add(removeCourse);
+        JLabel title = new JLabel("Adaptive Study & Learning Agent");
+        title.setForeground(java.awt.Color.WHITE);
+        title.setFont(Theme.BASE.deriveFont(java.awt.Font.BOLD, 22f));
+        JLabel subtitle = new JLabel("Plan your study time, practise, and review what you find hard");
+        subtitle.setForeground(new java.awt.Color(0xD6DBF5));
+        subtitle.setFont(Theme.BASE.deriveFont(13f));
+        JPanel titles = new JPanel(new BorderLayout());
+        titles.setOpaque(false);
+        titles.add(title, BorderLayout.NORTH);
+        titles.add(subtitle, BorderLayout.SOUTH);
+        JLabel courseLabel = new JLabel("Course");
+        courseLabel.setForeground(java.awt.Color.WHITE);
+        courseLabel.setFont(Theme.BASE.deriveFont(java.awt.Font.BOLD));
+        JPanel controls = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 10));
+        controls.setOpaque(false);
+        controls.add(courseLabel);
+        controls.add(courses);
+        controls.add(addCourse);
+        controls.add(renameCourse);
+        controls.add(removeCourse);
+        JPanel top = new JPanel(new BorderLayout());
+        top.setBackground(Theme.ACCENT);
+        top.setBorder(BorderFactory.createEmptyBorder(10, 16, 6, 10));
+        top.add(titles, BorderLayout.WEST);
+        top.add(controls, BorderLayout.EAST);
 
         JTabbedPane tabs = new JTabbedPane();
         add(tabs, "Tasks (F01, F07)", new TasksSection(app, clock, this::selectedCourse, this::refreshAllSections));
@@ -70,7 +88,9 @@ public class StudyGUI extends JFrame {
         add(tabs, "Review (F10)", new ReviewSection(app, clock, this::selectedCourse, this::refreshAllSections));
 
         JPanel status = new JPanel(new BorderLayout());
-        status.setBorder(BorderFactory.createEmptyBorder(4, 10, 4, 10));
+        status.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createMatteBorder(1, 0, 0, 0, Theme.BORDER),
+                BorderFactory.createEmptyBorder(6, 14, 6, 14)));
         status.add(GuiSupport.statusLabel, BorderLayout.WEST);
         status.add(new JLabel(aiConfigured ? "AI assistant: connected"
                 : "AI assistant: not configured (add LLM_API_KEY to .env)"), BorderLayout.EAST);
@@ -79,7 +99,7 @@ public class StudyGUI extends JFrame {
         super.add(top, BorderLayout.NORTH);
         super.add(tabs, BorderLayout.CENTER);
         super.add(status, BorderLayout.SOUTH);
-        setPreferredSize(new Dimension(1040, 680));
+        setPreferredSize(new Dimension(1120, 720));
         pack();
         setLocationRelativeTo(null);
         reloadCourses(null);
@@ -168,11 +188,7 @@ public class StudyGUI extends JFrame {
         StudyApplication application = new StudyApplication(repository, clock,
                 config.hasApiKey() ? DeepSeekClient.fromConfig(config) : null);
         SwingUtilities.invokeLater(() -> {
-            try {
-                UIManager.setLookAndFeel("javax.swing.plaf.nimbus.NimbusLookAndFeel");
-            } catch (Exception ignored) {
-                // The default look and feel is fine.
-            }
+            Theme.apply();
             new StudyGUI(application, clock, config.hasApiKey()).setVisible(true);
         });
     }

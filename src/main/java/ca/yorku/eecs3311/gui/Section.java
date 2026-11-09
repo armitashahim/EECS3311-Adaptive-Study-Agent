@@ -26,7 +26,7 @@ abstract class Section extends JPanel {
         this.clock = clock;
         this.selectedCourse = selectedCourse;
         this.refreshAll = refreshAll;
-        setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+        setBorder(BorderFactory.createEmptyBorder(12, 12, 12, 12));
     }
 
     /** Reloads what this tab shows from the application. */
@@ -55,7 +55,9 @@ abstract class Section extends JPanel {
     protected static JTable table(javax.swing.table.DefaultTableModel model) {
         JTable table = new JTable(model);
         table.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
-        table.setRowHeight(24);
+        table.setRowHeight(30);
+        table.setIntercellSpacing(new java.awt.Dimension(0, 0));
+        table.getTableHeader().setPreferredSize(new java.awt.Dimension(100, 32));
         table.setFillsViewportHeight(true);
         return table;
     }

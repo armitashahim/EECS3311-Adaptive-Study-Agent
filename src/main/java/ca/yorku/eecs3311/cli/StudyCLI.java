@@ -14,6 +14,8 @@ import ca.yorku.eecs3311.model.StudyPlan;
 import ca.yorku.eecs3311.model.StudySession;
 import ca.yorku.eecs3311.model.WeeklyPeriod;
 import ca.yorku.eecs3311.repository.LocalRepository;
+import ca.yorku.eecs3311.syllabus.SyllabusException;
+import ca.yorku.eecs3311.syllabus.TaskDraft;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStream;
@@ -52,6 +54,8 @@ public class StudyCLI {
     private final PrintStream output;
     private final Clock clock;
     private PlanProposal pendingProposal;
+    private List<TaskDraft> pendingDrafts = new ArrayList<>();
+    private String pendingDraftCourseId;
 
     public StudyCLI(StudyApplication application, InputStream input, PrintStream output,
                     Clock clock) {
@@ -122,6 +126,12 @@ public class StudyCLI {
                 case "task-add" -> addTask(args);
                 case "task-edit" -> editTask(args);
                 case "task-remove" -> removeTask(args);
+                case "syllabus-import" -> importSyllabus(args);
+                case "drafts" -> showDrafts();
+                case "draft-set" -> setDraft(args);
+                case "draft-remove" -> removeDraft(args);
+                case "syllabus-confirm" -> confirmDrafts();
+                case "syllabus-cancel" -> cancelDrafts();
                 case "materials" -> listMaterials(args);
                 case "material-import" -> importMaterial(args);
                 case "material-show" -> showMaterial(args);
@@ -142,6 +152,9 @@ public class StudyCLI {
             }
         } catch (IllegalArgumentException | IllegalStateException | DateTimeParseException e) {
             output.println("Error: " + e.getMessage());
+        } catch (SyllabusException e) {
+            output.println("Could not read tasks from the syllabus: " + e.getMessage());
+            output.println("No tasks were saved. You can add tasks yourself with task-add.");
         } catch (PdfImportException e) {
             output.println("Import failed: " + e.getMessage());
             output.println("No material was saved.");
@@ -168,6 +181,14 @@ public class StudyCLI {
                   task-add N TITLE TYPE YYYY-MM-DD HH:mm PRIORITY MINUTES
                   task-edit N T TITLE TYPE YYYY-MM-DD HH:mm PRIORITY
                   task-remove N T                      archive task T of course N
+                Syllabus import (F03) - uses the AI assistant
+                  syllabus-import N PDF_PATH           propose tasks from a syllabus PDF
+                  drafts                               show the proposed tasks
+                  draft-set D FIELD VALUE              D is a number or 'all'; FIELD is title, type,
+                                                       deadline (YYYY-MM-DD [HH:mm]), priority or minutes
+                  draft-remove D                       drop a proposed task
+                  syllabus-confirm                     save the tasks once every detail is filled in
+                  syllabus-cancel                      discard the proposals
                 Course materials (F08)
                   materials N                          list materials of course N
                   material-import N TITLE PDF_PATH     import a text-based PDF
@@ -268,6 +289,89 @@ public class StudyCLI {
         AcademicTask task = taskAt(courseAt(args.get(0)), args.get(1));
         application.removeTask(task.getId());
         output.println("Task removed. Its future sessions were dropped and past records kept.");
+    }
+
+    private void importSyllabus(List<String> args) throws PdfImportException, SyllabusException {
+        requireArgs(args, 2, "syllabus-import N PDF_PATH");
+        Course course = courseAt(args.get(0));
+        output.println("Reading the syllabus and asking the AI assistant...");
+        pendingDrafts = new ArrayList<>(
+                application.importSyllabus(course.getId(), Path.of(args.get(1))));
+        pendingDraftCourseId = course.getId();
+        output.println("Found " + pendingDrafts.size() + " possible tasks for " + course.getName()
+                + " (not saved yet).");
+        showDrafts();
+    }
+
+    private void showDrafts() {
+        if (pendingDrafts.isEmpty()) {
+            output.println("There are no proposed tasks. Use syllabus-import first.");
+            return;
+        }
+        for (int i = 0; i < pendingDrafts.size(); i++) {
+            TaskDraft draft = pendingDrafts.get(i);
+            output.printf("%d. %s [%s] due %s, priority %s, duration %s%n", i + 1,
+                    draft.getTitle(), draft.getType() == null ? "?" : draft.getType(),
+                    draft.getDeadline() == null ? "?" : draft.getDeadline().format(DATE_TIME),
+                    draft.getPriority() == null ? "?" : draft.getPriority(),
+                    draft.getEstimatedMinutes() == null ? "?" : draft.getEstimatedMinutes() + " min");
+        }
+        long incomplete = pendingDrafts.stream().filter(d -> !d.isComplete()).count();
+        output.println(incomplete == 0
+                ? "Every task is complete. Type syllabus-confirm to save them."
+                : incomplete + " task(s) still have a '?'. Fill them in with draft-set.");
+    }
+
+    private void setDraft(List<String> args) {
+        requireArgs(args, 3, "draft-set D FIELD VALUE");
+        List<TaskDraft> targets = args.get(0).equalsIgnoreCase("all")
+                ? pendingDrafts : List.of(pick(pendingDrafts, args.get(0), "draft"));
+        String field = args.get(1).toLowerCase(Locale.ROOT);
+        String value = args.get(2);
+        switch (field) {
+            case "title" -> targets.forEach(draft -> draft.setTitle(value));
+            case "type" -> targets.forEach(draft -> draft.setType(value));
+            case "priority" -> {
+                int priority = parseNumber(value, "priority");
+                targets.forEach(draft -> draft.setPriority(priority));
+            }
+            case "minutes" -> {
+                int minutes = parseNumber(value, "minutes");
+                targets.forEach(draft -> draft.setEstimatedMinutes(minutes));
+            }
+            case "deadline" -> {
+                java.time.LocalDateTime deadline = args.size() > 3
+                        ? parseDateTime(value, args.get(3))
+                        : parseDateTime(value, "23:59");
+                targets.forEach(draft -> draft.setDeadline(deadline));
+            }
+            default -> throw new IllegalArgumentException(
+                    "Unknown field '" + field + "'. Use title, type, deadline, priority or minutes.");
+        }
+        output.println("Updated.");
+    }
+
+    private void removeDraft(List<String> args) {
+        requireArgs(args, 1, "draft-remove D");
+        pendingDrafts.remove(pick(pendingDrafts, args.get(0), "draft"));
+        output.println("Draft removed.");
+    }
+
+    private void confirmDrafts() throws IOException {
+        if (pendingDrafts.isEmpty()) {
+            throw new IllegalStateException(
+                    "There are no proposed tasks to save. Use syllabus-import first.");
+        }
+        List<AcademicTask> saved = application.confirmTasks(pendingDraftCourseId, pendingDrafts);
+        output.println("Saved " + saved.size() + " task(s).");
+        pendingDrafts = new ArrayList<>();
+        pendingDraftCourseId = null;
+    }
+
+    private void cancelDrafts() {
+        pendingDrafts = new ArrayList<>();
+        pendingDraftCourseId = null;
+        output.println("Proposed tasks discarded. Nothing was saved.");
     }
 
     private void listMaterials(List<String> args) {

@@ -19,6 +19,9 @@ import ca.yorku.eecs3311.model.StudySession;
 import ca.yorku.eecs3311.model.TimeSlot;
 import ca.yorku.eecs3311.model.WeeklyPeriod;
 import ca.yorku.eecs3311.repository.LocalRepository;
+import ca.yorku.eecs3311.syllabus.SyllabusException;
+import ca.yorku.eecs3311.syllabus.SyllabusService;
+import ca.yorku.eecs3311.syllabus.TaskDraft;
 import ca.yorku.eecs3311.scheduling.ScheduleResult;
 import ca.yorku.eecs3311.scheduling.Scheduler;
 import java.io.IOException;
@@ -47,7 +50,7 @@ import java.util.Set;
  *
  * This version covers courses and tasks (F01), weekly availability (F02),
  * study progress (F06), duration estimates (F07), AI-assisted weekly
- * planning and revision (F04, F05) and course materials (F08).
+ * planning and revision (F04, F05), course materials (F08) and syllabus import (F03).
  */
 public class StudyApplication {
     private final LocalRepository repository;
@@ -593,6 +596,88 @@ public class StudyApplication {
 
     public void removeMaterial(String materialId) throws IOException {
         repository.deleteMaterial(materialId);
+    }
+
+    // ----- F03: syllabus import -----
+
+    /**
+     * Read a syllabus PDF and ask the AI for proposed tasks. Nothing is saved; the student
+     * reviews and completes the drafts, then calls {@link #confirmTasks}.
+     */
+    public List<TaskDraft> importSyllabus(String courseId, Path pdf)
+            throws PdfImportException, SyllabusException {
+        if (courseId == null || courseId.isBlank()) {
+            throw new IllegalArgumentException("Course ID cannot be empty.");
+        }
+        requireLlm();
+        repository.getCourse(courseId);
+
+        String text = pdfImporter.extractText(pdf);
+        return new SyllabusService(llm).extractTasks(text, now().toLocalDate());
+    }
+
+    /**
+     * Save the reviewed drafts as tasks of the course, all together. Every draft must be
+     * complete. A draft that was already saved (same id) is skipped, so a retry never
+     * creates duplicates. Accepted plans that could now gain work are flagged.
+     *
+     * @return the tasks that were newly saved
+     */
+    public List<AcademicTask> confirmTasks(String courseId, List<TaskDraft> drafts)
+            throws IOException {
+        if (courseId == null || courseId.isBlank()) {
+            throw new IllegalArgumentException("Course ID cannot be empty.");
+        }
+
+        if (drafts == null || drafts.isEmpty()) {
+            throw new IllegalArgumentException("Select at least one task to save.");
+        }
+
+        Course course = repository.getCourse(courseId);
+        List<String> problems = new ArrayList<>();
+        Set<String> ids = new LinkedHashSet<>();
+        for (int i = 0; i < drafts.size(); i++) {
+            TaskDraft draft = drafts.get(i);
+            if (!ids.add(draft.getId())) {
+                problems.add("Task " + (i + 1) + " ('" + draft.getTitle() + "') is listed twice.");
+            } else if (!draft.isComplete()) {
+                problems.add("Task " + (i + 1) + " ('" + draft.getTitle() + "') still needs: "
+                        + String.join(", ", draft.getMissingFields()) + ".");
+            }
+        }
+        if (!problems.isEmpty()) {
+            throw new IllegalArgumentException(String.join(" ", problems));
+        }
+
+        List<AcademicTask> created = new ArrayList<>();
+        for (TaskDraft draft : drafts) {
+            AcademicTask existing = findTask(draft.getId());
+            if (existing == null) {
+                created.add(draft.toTask(course));
+            } else if (!existing.getCourse().getId().equals(courseId)) {
+                throw new IllegalArgumentException(
+                        "Task '" + draft.getTitle() + "' already exists in another course.");
+            }
+        }
+
+        List<StudyPlan> flagged = new ArrayList<>();
+        LocalDateTime latestDeadline = created.stream().map(AcademicTask::getDeadline)
+                .max(Comparator.naturalOrder()).orElse(null);
+        if (latestDeadline != null) {
+            for (StudyPlan plan : repository.getPlans()) {
+                if (isLive(plan) && plan.isAccepted()
+                        && plan.getWeekStartDate().atStartOfDay().isBefore(latestDeadline)) {
+                    plan.markNeedsRevision();
+                    flagged.add(plan);
+                }
+            }
+        }
+
+        repository.commit(draft -> {
+            created.forEach(draft::saveTask);
+            flagged.forEach(draft::savePlan);
+        });
+        return List.copyOf(created);
     }
 
     // ----- Helpers -----

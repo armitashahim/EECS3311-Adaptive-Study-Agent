@@ -2,6 +2,7 @@ package ca.yorku.eecs3311.cli;
 
 import ca.yorku.eecs3311.agent.AgentException;
 import ca.yorku.eecs3311.ai.DeepSeekClient;
+import ca.yorku.eecs3311.ai.LLMClient;
 import ca.yorku.eecs3311.application.DurationSuggestion;
 import ca.yorku.eecs3311.application.PlanProposal;
 import ca.yorku.eecs3311.application.StudyApplication;
@@ -28,6 +29,7 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.DayOfWeek;
@@ -66,9 +68,20 @@ public class StudyCLI {
     private List<ReviewRecommendation> pendingRecommendations = new ArrayList<>();
     private String pendingRecommendationCourseId;
     private String pendingDraftCourseId;
+    private final boolean echo;
+    private int failedCommands;
 
     public StudyCLI(StudyApplication application, InputStream input, PrintStream output,
                     Clock clock) {
+        this(application, input, output, clock, false);
+    }
+
+    /**
+     * @param echo print each command after the prompt, so the output of a command file
+     *             reads like an interactive session
+     */
+    public StudyCLI(StudyApplication application, InputStream input, PrintStream output,
+                    Clock clock, boolean echo) {
         if (application == null || input == null || output == null || clock == null) {
             throw new IllegalArgumentException("CLI dependencies cannot be null.");
         }
@@ -76,33 +89,95 @@ public class StudyCLI {
         this.input = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8));
         this.output = output;
         this.clock = clock;
+        this.echo = echo;
     }
 
-    public static void main(String[] args) throws IOException {
-        Path file = Path.of(args.length > 0 ? args[0] : "data/repository.json");
-        LocalRepository repository = new LocalRepository(file);
-        AppConfig config = AppConfig.load();
-        StudyApplication application = new StudyApplication(repository, Clock.systemDefaultZone(),
-                config.hasApiKey() ? DeepSeekClient.fromConfig(config) : null);
-        new StudyCLI(application, System.in, System.out, Clock.systemDefaultZone()).run();
+    public static void main(String[] args) {
+        System.exit(launch(args, System.in, System.out, System.err));
     }
 
-    /** Reads commands until "exit" or the end of the input. */
-    public void run() throws IOException {
+    /**
+     * Runs the standalone CLI with the given options and returns the exit status:
+     * 0 if every command succeeded, 1 if a command failed, 2 if the options were invalid.
+     */
+    static int launch(String[] args, InputStream stdin, PrintStream out, PrintStream err) {
+        CliOptions options;
+        try {
+            options = CliOptions.parse(args);
+        } catch (IllegalArgumentException e) {
+            err.println("Error: " + e.getMessage());
+            err.println("Use --help to see the options.");
+            return 2;
+        }
+        if (options.help()) {
+            out.print(CliOptions.USAGE);
+            return 0;
+        }
+        try {
+            LLMClient llm = null;
+            if (!options.noLlm()) {
+                AppConfig config = AppConfig.load(options.envFile(), System.getenv())
+                        .withOverrides(options.apiKey(), options.baseUrl(), options.model());
+                if (config.hasApiKey()) {
+                    llm = DeepSeekClient.fromConfig(config);
+                } else {
+                    err.println("Note: no LLM API key found (use --api-key or set LLM_API_KEY in "
+                            + options.envFile() + "). AI commands will not be available.");
+                }
+            }
+            LocalRepository repository = new LocalRepository(options.dataFile());
+            StudyApplication application = new StudyApplication(repository,
+                    Clock.systemDefaultZone(), llm);
+            if (options.inputFile() != null) {
+                if (!Files.isRegularFile(options.inputFile())) {
+                    err.println("Error: input file not found: " + options.inputFile());
+                    return 2;
+                }
+                try (InputStream script = Files.newInputStream(options.inputFile())) {
+                    return new StudyCLI(application, script, out, Clock.systemDefaultZone(),
+                            options.echo()).run() == 0 ? 0 : 1;
+                }
+            }
+            return new StudyCLI(application, stdin, out, Clock.systemDefaultZone(),
+                    options.echo()).run() == 0 ? 0 : 1;
+        } catch (IOException | IllegalArgumentException e) {
+            err.println("Error: " + e.getMessage());
+            return 2;
+        }
+    }
+
+    /**
+     * Reads commands until "exit" or the end of the input. Blank lines and lines starting
+     * with # are skipped. Returns the number of commands that failed.
+     */
+    public int run() throws IOException {
         output.println("Adaptive Study Agent (type 'help' for commands, 'exit' to quit)");
         while (true) {
-            output.print("> ");
-            output.flush();
+            if (!echo) {
+                output.print("> ");
+                output.flush();
+            }
             String line = input.readLine();
             if (line == null) {
-                output.println();
-                return;
+                if (!echo) {
+                    output.println();
+                }
+                return failedCommands;
             }
             if (line.isBlank()) {
                 continue;
             }
+            if (line.strip().startsWith("#")) {
+                if (echo) {
+                    output.println(line.strip());
+                }
+                continue;
+            }
+            if (echo) {
+                output.println("> " + line.strip());
+            }
             if (!execute(line)) {
-                return;
+                return failedCommands;
             }
         }
     }
@@ -113,6 +188,7 @@ public class StudyCLI {
         try {
             words = tokenize(line);
         } catch (IllegalArgumentException e) {
+            failedCommands++;
             output.println("Error: " + e.getMessage());
             return true;
         }
@@ -166,27 +242,37 @@ public class StudyCLI {
                 case "record" -> recordProgress(args);
                 case "duration" -> showDuration(args);
                 case "duration-accept" -> acceptDuration(args);
-                default -> output.println("Unknown command '" + command
-                        + "'. Type 'help' to see the commands.");
+                default -> {
+                    failedCommands++;
+                    output.println("Unknown command '" + command
+                            + "'. Type 'help' to see the commands.");
+                }
             }
         } catch (IllegalArgumentException | IllegalStateException | DateTimeParseException e) {
+            failedCommands++;
             output.println("Error: " + e.getMessage());
         } catch (SyllabusException e) {
+            failedCommands++;
             output.println("Could not read tasks from the syllabus: " + e.getMessage());
             output.println("No tasks were saved. You can add tasks yourself with task-add.");
         } catch (QuizException e) {
+            failedCommands++;
             output.println("Could not create a quiz: " + e.getMessage());
             output.println("Nothing was saved.");
         } catch (ReviewException e) {
+            failedCommands++;
             output.println("Could not get recommendations: " + e.getMessage());
             output.println("Nothing was changed.");
         } catch (PdfImportException e) {
+            failedCommands++;
             output.println("Import failed: " + e.getMessage());
             output.println("No material was saved.");
         } catch (AgentException e) {
+            failedCommands++;
             output.println("The AI assistant could not produce a plan: " + e.getMessage());
             output.println("Nothing was changed.");
         } catch (IOException e) {
+            failedCommands++;
             output.println("Error: could not save your data (" + e.getMessage() + ")");
         }
         return true;
@@ -236,9 +322,10 @@ public class StudyCLI {
                   period-add availability|commitment DAY HH:mm HH:mm
                   period-remove N
                 Study plan (F04, F05) - uses the AI assistant
-                  plan [YYYY-MM-DD]                    show the saved plan for that week (default: this week)
-                  plan-generate [YYYY-MM-DD]           propose a new plan for the week
-                  plan-revise [YYYY-MM-DD]             propose a revision of the week's plan
+                  plan [WEEK]                          show the saved plan for that week (default: this week)
+                  plan-generate [WEEK]                 propose a new plan for the week
+                  plan-revise [WEEK]                   propose a revision of the week's plan
+                                                       WEEK is YYYY-MM-DD, 'this' or 'next'
                   plan-accept                          save the proposal shown
                   plan-reject                          discard the proposal shown
                 Progress (F06)
@@ -248,6 +335,7 @@ public class StudyCLI {
                   duration N T                         show the suggested duration for task T
                   duration-accept N T MINUTES          accept a duration for task T
                 Use "double quotes" around values that contain spaces.
+                Lines starting with # are ignored (useful in command files run with --input).
                   help, exit""");
     }
 
@@ -788,7 +876,14 @@ public class StudyCLI {
     }
 
     private LocalDate weekStart(String text) {
-        LocalDate date = text == null ? LocalDate.now(clock) : LocalDate.parse(text);
+        LocalDate date;
+        if (text == null || text.equalsIgnoreCase("this")) {
+            date = LocalDate.now(clock);
+        } else if (text.equalsIgnoreCase("next")) {
+            date = LocalDate.now(clock).plusWeeks(1);
+        } else {
+            date = LocalDate.parse(text);
+        }
         return date.with(TemporalAdjusters.previousOrSame(DayOfWeek.MONDAY));
     }
 

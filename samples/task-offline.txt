@@ -1,0 +1,20 @@
+# task-offline.txt - example that runs WITHOUT an LLM API key (deterministic features only)
+#
+# Run:
+#   java -jar target/Agent.jar --no-llm --input samples/task-offline.txt --data data/offline-demo.json
+
+# F01 - course and tasks
+course-add "Data Structures"
+task-add 1 "Assignment 1" assignment 2027-01-10 23:59 3 240
+task-add 1 "Quiz 1 preparation" exam 2027-01-12 10:00 2 90
+tasks 1
+
+# F02 - availability and a fixed commitment
+period-add availability tuesday 17:00 21:00
+period-add commitment tuesday 18:00 19:00
+periods
+
+# F07 - duration suggestion (falls back to the original estimate without history)
+duration 1 1
+
+exit

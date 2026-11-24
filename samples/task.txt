@@ -1,0 +1,30 @@
+# task.txt - example task for the Adaptive Study Agent (standalone CLI)
+#
+# Goal: set up a course with two deadlines and weekly availability, then ask the
+# AI planning agent to build next week's study plan and save it.
+#
+# Run (from the project folder, after building the jar):
+#   java -jar target/Agent.jar --input samples/task.txt --data data/task-demo.json
+#
+# Use a new --data file (or delete data/task-demo.json) before running again,
+# otherwise the course and periods are added a second time.
+
+# F01 - course and tasks
+course-add "EECS 3311"
+task-add 1 "Stage 3 testing report" assignment 2027-01-15 23:59 3 360
+task-add 1 "Design patterns review" exam 2027-01-20 18:00 2 180
+tasks 1
+
+# F02 - weekly availability and a fixed commitment
+period-add availability monday 18:00 21:00
+period-add availability wednesday 18:00 21:00
+period-add availability saturday 10:00 14:00
+period-add commitment saturday 12:00 13:00
+periods
+
+# F04 - the AI agent proposes next week's plan; the scheduler checks it
+plan-generate next
+plan-accept
+plan next
+
+exit

@@ -50,6 +50,24 @@ public class AppConfig {
         return new AppConfig(merged);
     }
 
+    /**
+     * Returns a copy of this configuration with the given values replacing the loaded ones.
+     * Null or blank arguments keep the loaded value. Used for command-line options.
+     */
+    public AppConfig withOverrides(String apiKey, String baseUrl, String model) {
+        Map<String, String> copy = new HashMap<>(values);
+        putIfPresent(copy, API_KEY, apiKey);
+        putIfPresent(copy, BASE_URL, baseUrl);
+        putIfPresent(copy, MODEL, model);
+        return new AppConfig(copy);
+    }
+
+    private static void putIfPresent(Map<String, String> target, String key, String value) {
+        if (value != null && !value.isBlank()) {
+            target.put(key, value.strip());
+        }
+    }
+
     static Map<String, String> parse(List<String> lines) {
         Map<String, String> result = new HashMap<>();
         for (String raw : lines) {

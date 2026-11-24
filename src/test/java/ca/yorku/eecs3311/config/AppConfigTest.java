@@ -62,4 +62,26 @@ class AppConfigTest {
 
         assertEquals("from-env", config.getApiKey());
     }
+
+    @Test
+    void commandLineOverridesReplaceLoadedValues() throws IOException {
+        Path file = directory.resolve(".env");
+        Files.writeString(file, "LLM_API_KEY=from-file\nLLM_MODEL=file-model\n");
+
+        AppConfig config = AppConfig.load(file, Map.of())
+                .withOverrides("from-option", " https://example.com ", null);
+
+        assertEquals("from-option", config.getApiKey());
+        assertEquals("https://example.com", config.getBaseUrl());
+        assertEquals("file-model", config.getModel());
+    }
+
+    @Test
+    void blankOverridesKeepLoadedValues() throws IOException {
+        AppConfig config = AppConfig.load(directory.resolve(".env"), Map.of())
+                .withOverrides(" ", null, "");
+
+        assertFalse(config.hasApiKey());
+        assertEquals("deepseek-flash", config.getModel());
+    }
 }

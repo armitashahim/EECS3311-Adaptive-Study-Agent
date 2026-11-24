@@ -79,6 +79,96 @@ Both programs keep their data in `data/repository.json` (created on first use, g
 as the first argument to use separate data, for example `-Dexec.args="data/demo.json"`. The GUI and CLI read the
 same file, so use one at a time.
 
+## Standalone CLI (`Agent.jar`)
+
+The CLI can also be built as a single runnable jar that includes all its dependencies, so it runs directly
+from a terminal with `java -jar`, without Maven.
+
+### Build
+
+```bash
+mvn clean package
+```
+
+This runs the tests and creates **`target/Agent.jar`**. To build faster without the tests, add `-DskipTests`.
+
+### Run a task file
+
+A task file is a plain-text list of CLI commands, one per line. Blank lines and lines starting with `#` are
+ignored. The agent runs every command in order, prints each one with its result, and exits.
+
+```bash
+java -jar target/Agent.jar --input samples/task.txt --data data/task-demo.json
+```
+
+[`samples/task.txt`](samples/task.txt) creates a course with two deadlines, adds weekly availability and a
+commitment, then asks the **AI planning agent** to build next week's study plan (`plan-generate next`) and
+saves it. It needs an API key, which is read from `.env` or passed with `--api-key`.
+
+To try the CLI **without an API key**, run the deterministic example:
+
+```bash
+java -jar target/Agent.jar --no-llm --input samples/task-offline.txt --data data/offline-demo.json
+```
+
+To see **most features in one run** (F01–F05 and F07–F10), use the full demo. It imports
+`samples/demo-syllabus.pdf` and `samples/sample-notes-sorting.pdf`, builds and revises a plan, takes a practice
+quiz, and accepts a review recommendation. It needs an API key.
+
+```bash
+java -jar target/Agent.jar --input samples/demo-all.txt --data data/demo-all.json
+```
+
+The script answers the quiz before it can see the questions. If 3 or more of those answers happen to be correct,
+Sorting is not a weak topic: `recommend` then reports that there are no weak topics, and `recommend-accept` fails.
+F06 is not in the script because progress can only be recorded once a session has started.
+
+| Sample file | Features | Needs API key |
+|---|---|---|
+| `samples/task.txt` | F01, F02, F04 | yes |
+| `samples/task-offline.txt` | F01, F02, F07 | no |
+| `samples/demo-all.txt` | F01–F05, F07–F10 | yes |
+
+Each run adds its course and periods to the data file. To run a task file again from a clean state, delete
+its data file first (for example `data/task-demo.json`) or pass a new `--data` file.
+
+### Options
+
+| Option | Meaning |
+|---|---|
+| `-i`, `--input FILE` | Run the commands in `FILE`, then exit. Use `-` to read commands from standard input. Without this option, the CLI starts an interactive session. |
+| `-d`, `--data FILE` | Data file to use (default `data/repository.json`). |
+| `--env FILE` | Configuration file with the LLM settings (default `.env`). |
+| `--api-key KEY` | LLM API key. Overrides `LLM_API_KEY` from the `.env` file. |
+| `--llm-api URL` | LLM API base URL (also accepted as `--base-url`). Overrides `LLM_BASE_URL`; default `https://api.deepseek.com`. |
+| `--model NAME` | LLM model name. Overrides `LLM_MODEL`; default `deepseek-flash`. |
+| `--no-llm` | Run without the AI assistant. AI commands (F03, F04, F05, F09, F10) report that it is off. |
+| `--echo` | Print each command before its output. This is on by default with `--input`. |
+| `-h`, `--help` | Show the options and exit. |
+
+LLM settings are applied in this order, with later ones taking priority: the `.env` file, then environment
+variables (`LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`), then command-line options. Passing the key with
+`--api-key` can leave it in your shell history, so the `.env` file is the safer choice.
+
+**Exit status:** `0` if every command succeeded, `1` if any command failed (for example, invalid input or an AI
+error), and `2` if the options were invalid or the input file was not found.
+
+### More examples
+
+```bash
+# Interactive session with a separate data file
+java -jar target/Agent.jar --data data/demo.json
+
+# Commands piped through standard input
+echo "courses" | java -jar target/Agent.jar --input - --no-llm
+
+# Show all options
+java -jar target/Agent.jar --help
+```
+
+In the CLI, `plan`, `plan-generate` and `plan-revise` accept a week as `YYYY-MM-DD`, `this` or `next`. The
+keyword `next` keeps task files valid from week to week.
+
 ## Run the tests
 
 ```bash
@@ -89,18 +179,18 @@ The tests use a scripted stand-in for the AI, so they need no key or network.
 
 ## Example usage (CLI)
 
-The folder `samples/` has two made-up PDFs: `sample-syllabus.pdf` and `sample-notes-sorting.pdf`.
+The folder `samples/` has made-up PDFs: `demo-syllabus.pdf` (Winter 2027 dates), `sample-syllabus.pdf` (Fall 2026
+dates, including one task with no date) and `sample-notes-sorting.pdf`.
 
 ```
 > course-add "Data Structures"
 > period-add availability monday 09:00 17:00
-> syllabus-import 1 samples/sample-syllabus.pdf
+> syllabus-import 1 samples/demo-syllabus.pdf
 > draft-set all priority 2
 > draft-set all minutes 90
 > drafts
-> draft-set 4 deadline 2026-12-01 17:00      (the task that had no date; check its number with 'drafts')
 > syllabus-confirm
-> plan-generate
+> plan-generate next
 > plan-accept
 > material-import 1 "Sorting notes" samples/sample-notes-sorting.pdf
 > quiz-generate 1 1 Sorting

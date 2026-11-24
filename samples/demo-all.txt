@@ -1,0 +1,66 @@
+# demo-all.txt - runs most of the agent's features in one go (needs an LLM API key)
+#
+# Run (from the project folder, after building the jar):
+#   java -jar target/Agent.jar --input samples/demo-all.txt --data data/demo-all.json
+#
+# Use a new --data file (or delete data/demo-all.json) before running again.
+#
+# Not included: F06 (progress can only be recorded once a session has started, and a new
+# plan's sessions are all in the future). F07 shows the fallback because there is no history yet.
+
+# F01 - course and a manual task
+course-add "EECS 2101"
+task-add 1 "Read chapter 4 (trees)" reading 2027-01-15 23:59 2 90
+
+# F02 - weekly availability and a fixed commitment
+period-add availability monday 18:00 21:00
+period-add availability wednesday 18:00 21:00
+period-add availability saturday 10:00 16:00
+period-add commitment saturday 12:00 13:00
+periods
+
+# F03 - the AI extracts tasks from the syllabus; we fill in priority and minutes, then save
+syllabus-import 1 samples/demo-syllabus.pdf
+draft-set all priority 2
+draft-set all minutes 120
+drafts
+syllabus-confirm
+tasks 1
+
+# F07 - duration suggestion (keeps the original estimate: no finished tasks yet)
+duration 1 1
+
+# F04 - the AI planning agent builds next week's plan; the scheduler validates it
+plan-generate next
+plan-accept
+
+# F05 - add more work and more free time, then ask the agent to revise next week's plan
+task-add 1 "Practice problems: heaps" assignment 2027-01-18 23:59 3 120
+period-add availability sunday 13:00 17:00
+plan-revise next
+plan-accept
+plan next
+
+# F08 - import course notes and show their extracted text
+material-import 1 "Sorting notes" samples/sample-notes-sorting.pdf
+materials 1
+material-show 1 1
+
+# F09 - the AI writes a 5-question quiz; answers are scored by the program
+quiz-generate 1 1 Sorting
+quiz-answer 1 D
+quiz-answer 2 D
+quiz-answer 3 D
+quiz-answer 4 D
+quiz-answer 5 D
+quiz-submit
+quiz-history 1
+
+# F10 - topic accuracy, then AI review recommendations for weak topics
+# (Sorting is weak if fewer than 3 of the 5 answers above were correct)
+topics 1
+recommend 1
+recommend-accept 1 45 2027-01-20 18:00 2
+tasks 1
+
+exit
